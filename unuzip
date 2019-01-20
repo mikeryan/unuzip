@@ -1,0 +1,131 @@
+#!/usr/bin/env python2
+
+# Copyright (c) 2019 Mike Ryan
+# This code is released under the terms of the MIT license. Refer to
+# COPYING for more details.
+
+import argparse
+import os
+import struct
+import zlib
+
+MAGIC = '#!/bin/sh'
+FORMAT_V2 = '#V2.0 Format'
+FORMAT_V3 = '#L3.0 Format'
+
+MAGIC_LEN = 128
+DEV_BSIZE = 512    # so sayeth FreeBSD
+MAX_BSIZE = 131072
+
+parser = argparse.ArgumentParser(
+    description='Decompress FreeBSD UZIP images',
+    epilog='''
+unuzip was written by Mike Ryan
+For more info and to file bugs, visit: https://github.com/mikeryan/unuzip''',
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+)
+parser.add_argument('infile', help='input file')
+parser.add_argument('outfile', help='output file (default: infile.ufs)', nargs='?')
+parser.add_argument('-v', help='be verbose', action='store_true')
+
+args = parser.parse_args()
+
+# open input/output files
+output_filename = args.outfile
+if output_filename is None:
+    output_filename = '%s.ufs' % args.infile
+
+try:
+    uzip_in = open(args.infile, 'rb')
+except IOError as e:
+    print "Error: can't open input file: %s" % e
+    exit(1)
+
+try:
+    ufs_out = open(output_filename, 'wb')
+except IOError as e:
+    print "Error: can't open output file: %s" % e
+    exit(1)
+
+# load magic, validate
+magic_in = uzip_in.read(MAGIC_LEN)
+if len(magic_in) != MAGIC_LEN:
+    print 'Error: file too short'
+    exit(1)
+
+magic_lines = magic_in.split('\n')
+if len(magic_lines) < 2 or magic_lines[0] != MAGIC:
+    print 'Error: file is not UZIP'
+    exit(1)
+
+if magic_lines[1] == FORMAT_V3:
+    print 'Error: unable to decompress V3 format files'
+    exit(1)
+
+if magic_lines[1] == FORMAT_V2:
+    print 'UZIP v2.0 file detected'
+else:
+    print 'Error: file is not UZIP'
+
+# load header, validate
+header = uzip_in.read(8)
+if len(header) != 8:
+    print 'Error: file too short'
+    exit(1)
+block_size, total_blocks = struct.unpack('>II', header)
+
+if block_size < DEV_BSIZE or block_size > MAX_BSIZE or \
+        block_size % DEV_BSIZE != 0:
+    print 'Error: invalid block size (%u)' % block_size
+    exit(1)
+
+total_size = block_size * total_blocks
+
+print 'Decompressing %s to %s' % (args.infile, output_filename)
+print ''
+print 'Block size:   %10u' % block_size
+print 'Total blocks: %10u' % total_blocks
+print 'Total size:   %10u' % total_size
+print ''
+
+ten_pct = total_blocks / 10
+
+idx = 0
+while idx < total_blocks:
+    # read the next two block offsets
+    offset_bytes = uzip_in.read(16)
+    if len(offset_bytes) < 16:
+        print 'Error: file truncated in TOC'
+        exit(1)
+    (offset, next_offset) = struct.unpack('>QQ', offset_bytes)
+    toc_offset = uzip_in.tell() - 8 # next TOC entry
+
+    block_compressed_len = next_offset - offset
+    if block_compressed_len < 0 or block_compressed_len > 2 * block_size:
+        print 'Error: invalid TOC entry at %u' % idx
+        exit(1)
+
+    # read and decompress block
+    uzip_in.seek(offset, os.SEEK_SET)
+
+    zlib_data = uzip_in.read(block_compressed_len)
+    if len(zlib_data) != block_compressed_len:
+        print 'Error: block data truncated at %u' % idx
+
+    block_data = zlib.decompress(zlib_data)
+    if len(block_data) != block_size:
+        print 'Error: decompression error at %u' % idx
+        exit(1)
+
+    if args.v:
+        print 'Block %6u: compressed size %6u' % (idx, block_compressed_len)
+    elif idx % ten_pct == 0:
+        print '%3d%%' % (idx / ten_pct * 10, )
+
+    # write the decompressed data to the new file
+    ufs_out.write(block_data)
+
+    idx += 1
+
+    # seek back to the TOC
+    uzip_in.seek(toc_offset, os.SEEK_SET)
